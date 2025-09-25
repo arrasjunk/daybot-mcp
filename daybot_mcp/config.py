@@ -24,6 +24,10 @@ class Settings(BaseSettings):
         env="ALPACA_BASE_URL"
     )
     
+    # Polygon.io API Configuration (optional backup data source)
+    polygon_api_key: Optional[str] = Field(default=None, env="POLYGON_API_KEY")
+    enable_polygon_backup: bool = Field(default=False, env="ENABLE_POLYGON_BACKUP")
+    
     # Risk Management Settings
     max_position_size: float = Field(default=0.02, env="MAX_POSITION_SIZE")  # 2% of portfolio
     max_daily_loss: float = Field(default=0.05, env="MAX_DAILY_LOSS")  # 5% daily loss limit

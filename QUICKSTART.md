@@ -24,6 +24,10 @@ ALPACA_API_KEY=your_alpaca_api_key_here
 ALPACA_SECRET_KEY=your_alpaca_secret_key_here
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 
+# Optional: Polygon.io backup data source (recommended for production)
+POLYGON_API_KEY=your_polygon_api_key_here
+ENABLE_POLYGON_BACKUP=false
+
 # Adjust risk settings as needed
 MAX_POSITION_SIZE=0.02      # 2% of portfolio per position
 MAX_DAILY_LOSS=0.05         # 5% daily loss limit
