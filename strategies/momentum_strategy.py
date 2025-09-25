@@ -8,7 +8,7 @@ import asyncio
 import httpx
 import json
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 import sys
 import os
@@ -23,6 +23,8 @@ from daybot_mcp.audit_logger import (
     EventType,
     LogLevel
 )
+from daybot_mcp.indicators import IndicatorManager, ATR
+from daybot_mcp.risk import RiskManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,9 +45,12 @@ class MomentumStrategy:
         self.client = httpx.AsyncClient(timeout=30.0)
         self.positions = {}
         self.max_positions = 5
-        self.risk_per_trade = 0.02  # 2% risk per trade (increased for better take-profit spacing)
+        self.risk_per_trade = 0.02  # 2% risk per trade
         self.running = False
         self.audit_logger = None
+        self.risk_manager = RiskManager()
+        self.indicators = {}  # Store IndicatorManager instances per symbol
+        self.use_atr_stops = True  # Enable ATR-based dynamic stops
     
     async def __aenter__(self):
         return self
@@ -98,6 +103,23 @@ class MomentumStrategy:
         except Exception:
             return []
     
+    async def get_symbol_atr(self, symbol: str) -> Optional[float]:
+        """
+        Get ATR value for a symbol. In a real implementation, this would
+        fetch recent price data and calculate ATR.
+        """
+        try:
+            # Placeholder: In real implementation, fetch recent bars and calculate ATR
+            # For now, simulate ATR based on symbol characteristics
+            if symbol in ['TSLA', 'NVDA', 'AMD']:  # High volatility stocks
+                return 5.0
+            elif symbol in ['AAPL', 'MSFT', 'GOOGL']:  # Medium volatility
+                return 3.0
+            else:  # Lower volatility
+                return 2.0
+        except Exception:
+            return None
+    
     async def enter_trade(self, symbol: str, side: str = "buy") -> Dict[str, Any]:
         """Enter a new trade with risk management."""
         if self.audit_logger:
@@ -110,12 +132,52 @@ class MomentumStrategy:
             )
         
         try:
+            # Get current portfolio value for position sizing
+            risk_status = await self.get_risk_status()
+            portfolio_value = risk_status.get('portfolio_value', 100000)  # Default fallback
+            
+            # Calculate position size using ATR if available
+            quantity = 1  # Default fallback
+            if self.use_atr_stops:
+                atr_value = await self.get_symbol_atr(symbol)
+                if atr_value:
+                    # Get current price (simplified - in real implementation get from market data)
+                    entry_price = 100.0  # Placeholder - would get real price
+                    
+                    # Calculate ATR-based position size
+                    position_result = self.risk_manager.calculate_atr_position_size(
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        atr_value=atr_value,
+                        portfolio_value=portfolio_value,
+                        risk_percent=self.risk_per_trade
+                    )
+                    
+                    quantity = max(1, position_result.recommended_shares)
+                    
+                    if self.audit_logger:
+                        self.audit_logger.log_strategy_event(
+                            EventType.POSITION_SIZING,
+                            f"ATR-based position sizing for {symbol}",
+                            "momentum_strategy",
+                            symbol=symbol,
+                            metadata={
+                                "atr_value": atr_value,
+                                "entry_price": entry_price,
+                                "quantity": quantity,
+                                "stop_loss": position_result.stop_loss_price,
+                                "take_profit": position_result.take_profit_price,
+                                "risk_amount": position_result.risk_amount,
+                                "warnings": position_result.warnings
+                            }
+                        )
+            
             response = await self.client.post(
                 f"{self.base_url}/tools/enter_trade",
                 json={
                     "symbol": symbol,
                     "side": side,
-                    "quantity": 1,  # Use fixed quantity to avoid position sizing issues
+                    "quantity": quantity,
                     "order_type": "market"
                 }
             )
@@ -197,14 +259,20 @@ class MomentumStrategy:
     
     def should_exit_trade(self, position: Dict[str, Any]) -> bool:
         """
-        Exit signal logic.
+        Exit signal logic with ATR-based dynamic exits.
         In a real strategy, this would analyze current market conditions.
         """
-        # Placeholder logic - replace with real exit conditions
+        symbol = position.get('symbol')
         unrealized_pl_pct = position.get('unrealized_plpc', 0)
         
-        # Take profits at 4% or cut losses at 2%
-        return unrealized_pl_pct >= 4.0 or unrealized_pl_pct <= -2.0
+        if self.use_atr_stops and symbol in self.indicators:
+            # Use ATR-based exit logic (positions should hit their bracket orders)
+            # Only exit manually if there's a strong reversal signal
+            # For now, let bracket orders handle exits
+            return False
+        else:
+            # Fallback to percentage-based exits
+            return unrealized_pl_pct >= 4.0 or unrealized_pl_pct <= -2.0
     
     async def check_risk_limits(self) -> bool:
         """Check if we're within risk limits with retry logic."""
@@ -359,9 +427,10 @@ class MomentumStrategy:
             )
             self.audit_logger = get_audit_logger()
         
-        logger.info("🚀 Starting Momentum Strategy (Rate-Limited Version)")
+        logger.info("🚀 Starting Momentum Strategy with ATR-Based Dynamic Stops")
         logger.info(f"Max positions: {self.max_positions}")
         logger.info(f"Risk per trade: {self.risk_per_trade * 100:.1f}%")
+        logger.info(f"ATR-based stops: {'Enabled' if self.use_atr_stops else 'Disabled'}")
         logger.info(f"Cycle interval: {cycle_interval} seconds")
         logger.info("⚠️  Using conservative rate limiting to avoid API limits")
         
@@ -372,7 +441,8 @@ class MomentumStrategy:
                 metadata={
                     "max_positions": self.max_positions,
                     "risk_per_trade": self.risk_per_trade,
-                    "cycle_interval": cycle_interval
+                    "cycle_interval": cycle_interval,
+                    "atr_stops_enabled": self.use_atr_stops
                 }
             )
         

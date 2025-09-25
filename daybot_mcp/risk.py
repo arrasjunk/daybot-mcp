@@ -132,18 +132,24 @@ class RiskManager:
         stop_loss_price: Optional[float] = None,
         portfolio_value: float = 0,
         risk_percent: float = None,
-        atr_value: Optional[float] = None
+        atr_value: Optional[float] = None,
+        atr_stop_multiplier: float = 1.5,
+        atr_target_multiplier: float = 3.0,
+        use_atr_dynamic: bool = True
     ) -> PositionSizeResult:
         """
-        Calculate position size based on risk management rules.
+        Calculate position size based on risk management rules with ATR-based dynamic stops.
         
         Args:
             symbol: Trading symbol
             entry_price: Intended entry price
-            stop_loss_price: Stop loss price (optional)
+            stop_loss_price: Stop loss price (optional, overridden by ATR if use_atr_dynamic=True)
             portfolio_value: Current portfolio value
             risk_percent: Risk percentage (defaults to config)
-            atr_value: ATR value for dynamic stop loss
+            atr_value: ATR value for dynamic stop loss calculation
+            atr_stop_multiplier: ATR multiplier for stop loss (default 1.5)
+            atr_target_multiplier: ATR multiplier for take profit (default 3.0)
+            use_atr_dynamic: Use ATR-based dynamic stops instead of fixed percentages
         """
         warnings = []
         
@@ -151,15 +157,19 @@ class RiskManager:
         if risk_percent is None:
             risk_percent = settings.default_stop_loss
         
-        # Calculate stop loss if not provided
-        if stop_loss_price is None and atr_value is not None:
-            # Use 2x ATR for stop loss
+        # Calculate stop loss based on ATR or fixed percentage
+        if use_atr_dynamic and atr_value is not None:
+            # Use ATR-based dynamic stop loss (recommended approach)
+            stop_loss_price = entry_price - (atr_stop_multiplier * atr_value)
+            warnings.append(f"Using {atr_stop_multiplier}x ATR stop loss: ${stop_loss_price:.2f} (ATR: ${atr_value:.2f})")
+        elif stop_loss_price is None and atr_value is not None:
+            # Fallback to 2x ATR if not using dynamic but ATR available
             stop_loss_price = entry_price - (2 * atr_value)
-            warnings.append(f"Using ATR-based stop loss: ${stop_loss_price:.2f}")
+            warnings.append(f"Using 2x ATR stop loss: ${stop_loss_price:.2f}")
         elif stop_loss_price is None:
-            # Use default percentage stop loss
+            # Use default percentage stop loss as last resort
             stop_loss_price = entry_price * (1 - settings.default_stop_loss)
-            warnings.append(f"Using default {settings.default_stop_loss*100}% stop loss")
+            warnings.append(f"Using default {settings.default_stop_loss*100}% stop loss (no ATR available)")
         
         # Calculate risk per share
         risk_per_share = abs(entry_price - stop_loss_price)
@@ -198,8 +208,14 @@ class RiskManager:
         actual_risk_amount = recommended_shares * risk_per_share
         position_risk_percent = (actual_risk_amount / portfolio_value) * 100 if portfolio_value > 0 else 0
         
-        # Calculate take profit (default 2:1 risk/reward)
-        take_profit_price = entry_price + (2 * risk_per_share)
+        # Calculate take profit based on ATR or risk/reward ratio
+        if use_atr_dynamic and atr_value is not None:
+            # Use ATR-based dynamic take profit
+            take_profit_price = entry_price + (atr_target_multiplier * atr_value)
+            warnings.append(f"Using {atr_target_multiplier}x ATR take profit: ${take_profit_price:.2f}")
+        else:
+            # Use traditional 2:1 risk/reward ratio
+            take_profit_price = entry_price + (2 * risk_per_share)
         
         # Ensure minimum $0.01 profit for Alpaca compliance
         min_profit_required = 0.01
@@ -335,3 +351,74 @@ class RiskManager:
             "max_heat_percent": settings.max_daily_loss * 100,
             "heat_status": "high" if portfolio_heat_percent > 15 else "medium" if portfolio_heat_percent > 8 else "low"
         }
+    
+    def calculate_atr_position_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        atr_value: float,
+        portfolio_value: float,
+        risk_percent: float = None,
+        volatility_regime: str = "normal"
+    ) -> PositionSizeResult:
+        """
+        Calculate position size using ATR-based dynamic stops with volatility regime adjustments.
+        
+        Args:
+            symbol: Trading symbol
+            entry_price: Intended entry price
+            atr_value: Current ATR value for the symbol
+            portfolio_value: Current portfolio value
+            risk_percent: Risk percentage (defaults to config)
+            volatility_regime: "low", "normal", "high" - adjusts ATR multipliers
+        
+        Returns:
+            PositionSizeResult with ATR-based calculations
+        """
+        # Adjust ATR multipliers based on volatility regime
+        if volatility_regime == "low":
+            # In low volatility, use tighter stops and targets
+            atr_stop_multiplier = 1.0
+            atr_target_multiplier = 2.0
+        elif volatility_regime == "high":
+            # In high volatility, use wider stops and targets
+            atr_stop_multiplier = 2.0
+            atr_target_multiplier = 4.0
+        else:  # normal
+            # Standard ATR multipliers
+            atr_stop_multiplier = 1.5
+            atr_target_multiplier = 3.0
+        
+        return self.shares_for_trade(
+            symbol=symbol,
+            entry_price=entry_price,
+            portfolio_value=portfolio_value,
+            risk_percent=risk_percent,
+            atr_value=atr_value,
+            atr_stop_multiplier=atr_stop_multiplier,
+            atr_target_multiplier=atr_target_multiplier,
+            use_atr_dynamic=True
+        )
+    
+    def detect_volatility_regime(self, atr_value: float, atr_sma_20: float) -> str:
+        """
+        Detect current volatility regime based on ATR relative to its moving average.
+        
+        Args:
+            atr_value: Current ATR value
+            atr_sma_20: 20-period simple moving average of ATR
+        
+        Returns:
+            "low", "normal", or "high" volatility regime
+        """
+        if atr_sma_20 == 0:
+            return "normal"
+        
+        atr_ratio = atr_value / atr_sma_20
+        
+        if atr_ratio < 0.8:
+            return "low"
+        elif atr_ratio > 1.2:
+            return "high"
+        else:
+            return "normal"
