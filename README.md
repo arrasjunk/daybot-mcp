@@ -147,6 +147,12 @@ uvicorn daybot_mcp.server:app --host 0.0.0.0 --port 8000 --reload
 uvicorn daybot_mcp.server:app --host 0.0.0.0 --port 8000
 ```
 
+Or use the dev auto-port launcher (tries 8000, then 8001, 8002, ...):
+
+```bash
+python dev_server.py --reload
+```
+
 #### Performance Dashboard
 
 - Visit the interactive dashboard at: `http://localhost:8000/dashboard/`
