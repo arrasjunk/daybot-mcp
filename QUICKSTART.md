@@ -48,14 +48,15 @@ uvicorn daybot_mcp.server:app --host 0.0.0.0 --port 8000 --reload
 ## 4. Test Your Setup
 
 ```bash
-# Run the demo
-python demo.py
+# Run the analytics demo (seeds sample trades and prints reports)
+python demo_analytics.py
 
 # Check health
 curl http://localhost:8000/tools/healthcheck
 
-# View API docs
+# View API docs and the performance dashboard
 open http://localhost:8000/docs
+open http://localhost:8000/dashboard/
 ```
 
 ## 5. Your First Trade
@@ -154,6 +155,29 @@ curl http://localhost:8000/audit/symbol_performance
 ```bash
 python examples/logging_example.py
 ```
+
+### 📊 Performance Analytics (NEW!)
+
+New analytics endpoints and a web dashboard are available for post-trade analysis:
+
+```bash
+# Performance metrics
+curl "http://localhost:8000/analytics/performance?period=monthly"
+
+# Risk analysis and drawdown metrics
+curl http://localhost:8000/analytics/risk
+
+# Execution quality and slippage analysis
+curl http://localhost:8000/analytics/execution
+
+# Strategy optimization recommendations
+curl http://localhost:8000/analytics/optimization
+
+# Browse dashboard
+open http://localhost:8000/dashboard/
+```
+
+See `ANALYTICS_README.md` for detailed documentation and examples.
 
 ## 7. Safety Features
 

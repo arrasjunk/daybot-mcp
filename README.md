@@ -147,6 +147,12 @@ uvicorn daybot_mcp.server:app --host 0.0.0.0 --port 8000 --reload
 uvicorn daybot_mcp.server:app --host 0.0.0.0 --port 8000
 ```
 
+#### Performance Dashboard
+
+- Visit the interactive dashboard at: `http://localhost:8000/dashboard/`
+- The dashboard provides real-time performance metrics, risk analytics, execution quality, and optimization recommendations.
+- See `ANALYTICS_README.md` for full capabilities, API details, and screenshots.
+
 ### API Endpoints
 
 #### Core MCP Tool Endpoints
@@ -166,6 +172,18 @@ uvicorn daybot_mcp.server:app --host 0.0.0.0 --port 8000
 - `GET /orders` - Get orders by status
 - `GET /account` - Get account information
 - `GET /trade_log` - Get recent trade events
+
+#### Analytics Endpoints
+
+- `GET /analytics/performance` - Comprehensive performance metrics
+- `GET /analytics/risk` - Risk analysis and drawdown metrics
+- `GET /analytics/execution` - Execution quality and slippage analysis
+- `GET /analytics/optimization` - Strategy optimization recommendations
+- `GET /analytics/strategy/{strategy_name}` - Analyze a specific strategy
+- `GET /analytics/trades` - Trade data with filtering (symbol, strategy, dates)
+- `POST /analytics/sync` - Parse audit logs and sync trades into analytics DB
+
+For detailed examples and output formats, refer to `ANALYTICS_README.md`.
 
 ### Example Usage
 

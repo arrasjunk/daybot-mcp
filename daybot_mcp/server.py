@@ -29,6 +29,11 @@ from .audit_logger import (
     LogLevel
 )
 from .log_analyzer import LogAnalyzer
+from .analytics import initialize_analytics, get_analytics_engine, AnalyticsPeriod
+from .dashboard import dashboard_app
+from .risk_analytics import RiskAnalyzer
+from .execution_analytics import ExecutionAnalyzer
+from .strategy_optimizer import StrategyOptimizer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +60,9 @@ risk_manager = RiskManager()
 indicator_managers: Dict[str, IndicatorManager] = {}
 trade_log: List[TradeEvent] = []
 log_analyzer: Optional[LogAnalyzer] = None
+
+# Mount the dashboard app
+app.mount("/dashboard", dashboard_app, name="dashboard")
 
 
 # Pydantic models for request/response
@@ -494,6 +502,7 @@ async def manage_trade(request: ManageTradeRequest):
 @app.post("/tools/close_symbol")
 async def close_symbol(request: CloseSymbolRequest):
     """Idempotent close with verification."""
+    audit_logger = get_audit_logger()
     try:
         async with AlpacaClient() as client:
             result = await close_with_verification(
@@ -529,11 +538,10 @@ async def close_symbol(request: CloseSymbolRequest):
                 trade_log.append(trade_event)
             
             return result.dict()
-    
+
     except Exception as e:
         logger.error(f"Error closing symbol: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/tools/flat_all")
 async def flat_all():
@@ -933,6 +941,267 @@ async def get_account():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Analytics Endpoints
+
+@app.get("/analytics/performance")
+async def get_performance_analytics(
+    period: AnalyticsPeriod = AnalyticsPeriod.ALL_TIME,
+    strategy: Optional[str] = None,
+    symbol: Optional[str] = None
+):
+    """Get comprehensive performance analytics."""
+    try:
+        analyzer = get_analytics_engine()
+        
+        # Calculate date range based on period
+        end_date = datetime.now(timezone.utc)
+        start_date = None
+        
+        if period != AnalyticsPeriod.ALL_TIME:
+            from datetime import timedelta
+            period_map = {
+                AnalyticsPeriod.DAILY: timedelta(days=1),
+                AnalyticsPeriod.WEEKLY: timedelta(weeks=1),
+                AnalyticsPeriod.MONTHLY: timedelta(days=30),
+                AnalyticsPeriod.QUARTERLY: timedelta(days=90),
+                AnalyticsPeriod.YEARLY: timedelta(days=365)
+            }
+            start_date = end_date - period_map[period]
+        
+        # Get trades
+        trades = analyzer.get_trades(
+            start_date=start_date,
+            end_date=end_date,
+            strategy=strategy,
+            symbol=symbol
+        )
+        
+        # Calculate metrics
+        metrics = analyzer.calculate_performance_metrics(trades)
+        
+        return {
+            "period": period.value,
+            "filters": {"strategy": strategy, "symbol": symbol},
+            "metrics": {
+                "total_trades": metrics.total_trades,
+                "win_rate": metrics.win_rate,
+                "profit_factor": metrics.profit_factor,
+                "expectancy": metrics.expectancy,
+                "net_profit": metrics.net_profit,
+                "max_drawdown": metrics.max_drawdown_percent,
+                "sharpe_ratio": metrics.sharpe_ratio,
+                "avg_win": metrics.avg_win,
+                "avg_loss": metrics.avg_loss,
+                "kelly_criterion": metrics.kelly_criterion
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/risk")
+async def get_risk_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get comprehensive risk analytics."""
+    try:
+        analyzer = get_analytics_engine()
+        risk_analyzer = RiskAnalyzer(analyzer)
+        
+        # Parse dates
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+        end_dt = datetime.fromisoformat(end_date) if end_date else None
+        
+        # Get trades
+        trades = analyzer.get_trades(start_date=start_dt, end_date=end_dt)
+        
+        # Generate risk report
+        risk_report = risk_analyzer.generate_risk_report(trades)
+        
+        return risk_report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/execution")
+async def get_execution_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get execution quality analytics."""
+    try:
+        analyzer = get_analytics_engine()
+        execution_analyzer = ExecutionAnalyzer(analyzer)
+        
+        # Parse dates
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+        end_dt = datetime.fromisoformat(end_date) if end_date else None
+        
+        # Get trades
+        trades = analyzer.get_trades(start_date=start_dt, end_date=end_dt)
+        
+        # Generate execution report
+        execution_report = execution_analyzer.generate_execution_report(trades)
+        
+        return execution_report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/optimization")
+async def get_optimization_recommendations(
+    strategy: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get strategy optimization recommendations."""
+    try:
+        analyzer = get_analytics_engine()
+        optimizer = StrategyOptimizer(analyzer)
+        
+        # Parse dates
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+        end_dt = datetime.fromisoformat(end_date) if end_date else None
+        
+        # Get trades
+        trades = analyzer.get_trades(
+            start_date=start_dt,
+            end_date=end_dt,
+            strategy=strategy
+        )
+        
+        # Generate optimization report
+        optimization_report = optimizer.generate_optimization_report(trades)
+        
+        return optimization_report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/strategy/{strategy_name}")
+async def analyze_strategy(
+    strategy_name: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Analyze specific strategy performance."""
+    try:
+        analyzer = get_analytics_engine()
+        optimizer = StrategyOptimizer(analyzer)
+        
+        # Parse dates
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+        end_dt = datetime.fromisoformat(end_date) if end_date else None
+        
+        # Get trades for strategy
+        trades = analyzer.get_trades(
+            start_date=start_dt,
+            end_date=end_dt,
+            strategy=strategy_name
+        )
+        
+        # Analyze strategy
+        strategy_analysis = optimizer.analyze_strategy_performance(trades, strategy_name)
+        
+        return {
+            "strategy_analysis": {
+                "name": strategy_analysis.strategy_name,
+                "total_trades": strategy_analysis.total_trades,
+                "performance_score": strategy_analysis.performance_score,
+                "optimization_potential": strategy_analysis.optimization_potential,
+                "metrics": {
+                    "win_rate": strategy_analysis.win_rate,
+                    "profit_factor": strategy_analysis.profit_factor,
+                    "expectancy": strategy_analysis.expectancy,
+                    "max_drawdown": strategy_analysis.max_drawdown,
+                    "sharpe_ratio": strategy_analysis.sharpe_ratio
+                },
+                "strengths": strategy_analysis.strengths,
+                "weaknesses": strategy_analysis.weaknesses,
+                "top_symbols": strategy_analysis.best_performing_symbols,
+                "worst_symbols": strategy_analysis.worst_performing_symbols
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analytics/sync")
+async def sync_analytics_data():
+    """Sync trade data from log files to analytics database."""
+    try:
+        analyzer = get_analytics_engine()
+        trades_added = analyzer.parse_log_files()
+        
+        return {
+            "success": True,
+            "trades_synced": trades_added,
+            "message": f"Successfully synced {trades_added} trades from log files"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/trades")
+async def get_trades_data(
+    limit: int = 100,
+    symbol: Optional[str] = None,
+    strategy: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get trades data with filtering."""
+    try:
+        analyzer = get_analytics_engine()
+        
+        # Parse dates
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+        end_dt = datetime.fromisoformat(end_date) if end_date else None
+        
+        # Get trades
+        trades = analyzer.get_trades(
+            start_date=start_dt,
+            end_date=end_dt,
+            symbol=symbol,
+            strategy=strategy,
+            limit=limit
+        )
+        
+        # Format trades for response
+        trades_data = []
+        for trade in trades:
+            trades_data.append({
+                "symbol": trade.symbol,
+                "strategy": trade.strategy,
+                "entry_time": trade.entry_time.isoformat(),
+                "exit_time": trade.exit_time.isoformat(),
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "quantity": trade.quantity,
+                "side": trade.side,
+                "pnl": trade.pnl,
+                "pnl_percent": trade.pnl_percent,
+                "duration_minutes": trade.duration_minutes,
+                "outcome": trade.outcome.value,
+                "exit_reason": trade.exit_reason
+            })
+        
+        return {
+            "trades": trades_data,
+            "total_count": len(trades_data),
+            "filters": {
+                "symbol": symbol,
+                "strategy": strategy,
+                "start_date": start_date,
+                "end_date": end_date,
+                "limit": limit
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Background tasks
 
 @app.on_event("startup")
@@ -950,6 +1219,9 @@ async def startup_event():
     
     # Initialize log analyzer
     log_analyzer = LogAnalyzer("logs")
+    
+    # Initialize analytics engine
+    initialize_analytics("logs")
     
     # Validate configuration
     if not validate_config():
@@ -1010,7 +1282,13 @@ async def root():
             "/tools/flat_all",
             "/tools/healthcheck",
             "/tools/risk_status",
-            "/tools/record_trade"
+            "/tools/record_trade",
+            "/analytics/performance",
+            "/analytics/risk",
+            "/analytics/execution",
+            "/analytics/optimization",
+            "/analytics/trades",
+            "/dashboard/"
         ]
     }
 
