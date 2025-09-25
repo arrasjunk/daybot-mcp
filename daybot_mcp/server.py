@@ -1,0 +1,671 @@
+"""
+FastAPI server with MCP tool endpoints for algorithmic trading.
+Provides REST endpoints following MCP schema for trading operations.
+"""
+
+import asyncio
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import logging
+
+from .config import settings, validate_config
+from .alpaca_client import AlpacaClient
+from .risk import RiskManager, PositionSizeResult
+from .utils import (
+    close_with_verification, 
+    flatten_all_positions, 
+    create_trade_event,
+    TradeEvent
+)
+from .indicators import IndicatorManager
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="DayBot MCP Server",
+    description="MCP tool server for algorithmic trading with Alpaca",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global instances
+risk_manager = RiskManager()
+indicator_managers: Dict[str, IndicatorManager] = {}
+trade_log: List[TradeEvent] = []
+
+
+# Pydantic models for request/response
+class ScanSymbolsRequest(BaseModel):
+    """Request model for symbol scanning."""
+    market_cap_min: Optional[float] = None
+    volume_min: Optional[float] = None
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    sector: Optional[str] = None
+
+
+class ScanSymbolsResponse(BaseModel):
+    """Response model for symbol scanning."""
+    symbols: List[str]
+    scan_time: str
+    criteria: Dict[str, Any]
+
+
+class EnterTradeRequest(BaseModel):
+    """Request model for entering a trade."""
+    symbol: str
+    side: str = Field(..., pattern="^(buy|sell)$")
+    quantity: Optional[float] = None
+    entry_price: Optional[float] = None
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    order_type: str = Field(default="market", pattern="^(market|limit)$")
+    time_in_force: str = Field(default="day", pattern="^(day|gtc|ioc|fok)$")
+    risk_percent: Optional[float] = None
+
+
+class EnterTradeResponse(BaseModel):
+    """Response model for entering a trade."""
+    success: bool
+    order_ids: List[str]
+    symbol: str
+    quantity: float
+    entry_price: Optional[float]
+    stop_loss_price: Optional[float]
+    take_profit_price: Optional[float]
+    position_size_info: Optional[PositionSizeResult]
+    message: str
+    timestamp: str
+
+
+class ManageTradeRequest(BaseModel):
+    """Request model for managing a trade."""
+    symbol: str
+    action: str = Field(..., pattern="^(adjust_stop|trail_stop|partial_exit|add_to_position)$")
+    new_stop_price: Optional[float] = None
+    trail_amount: Optional[float] = None
+    exit_quantity: Optional[float] = None
+    add_quantity: Optional[float] = None
+
+
+class ManageTradeResponse(BaseModel):
+    """Response model for managing a trade."""
+    success: bool
+    symbol: str
+    action: str
+    message: str
+    new_orders: List[str]
+    cancelled_orders: List[str]
+    timestamp: str
+
+
+class CloseSymbolRequest(BaseModel):
+    """Request model for closing a symbol."""
+    symbol: str
+    quantity: Optional[float] = None
+
+
+class HealthCheckResponse(BaseModel):
+    """Response model for health check."""
+    status: str
+    account_status: str
+    market_open: bool
+    buying_power: float
+    portfolio_value: float
+    timestamp: str
+    config_valid: bool
+
+
+class RiskStatusResponse(BaseModel):
+    """Response model for risk status."""
+    portfolio_value: float
+    daily_pnl: float
+    daily_pnl_percent: float
+    max_daily_loss_percent: float
+    total_exposure: float
+    positions_count: int
+    risk_level: str
+    portfolio_heat: Dict[str, Any]
+    timestamp: str
+
+
+class RecordTradeRequest(BaseModel):
+    """Request model for recording a trade."""
+    event_type: str
+    symbol: str
+    price: float
+    quantity: float
+    side: str
+    order_id: Optional[str] = None
+    pnl: Optional[float] = None
+    reason: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+
+# MCP Tool Endpoints
+
+@app.post("/tools/scan_symbols", response_model=ScanSymbolsResponse)
+async def scan_symbols(request: ScanSymbolsRequest):
+    """
+    Scan for symbols based on criteria.
+    Currently returns a stubbed watchlist - extend with actual scanner later.
+    """
+    # Stubbed implementation - replace with actual scanner
+    watchlist = [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",
+        "NVDA", "META", "NFLX", "AMD", "CRM",
+        "SPY", "QQQ", "IWM", "ARKK", "TQQQ"
+    ]
+    
+    # Apply basic filtering if criteria provided
+    filtered_symbols = watchlist
+    
+    if request.price_min or request.price_max:
+        # In a real implementation, you would filter by actual prices
+        pass
+    
+    return ScanSymbolsResponse(
+        symbols=filtered_symbols,
+        scan_time=datetime.now(timezone.utc).isoformat(),
+        criteria=request.dict()
+    )
+
+
+@app.post("/tools/enter_trade", response_model=EnterTradeResponse)
+async def enter_trade(request: EnterTradeRequest):
+    """Submit bracket orders with stop loss and take profit."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    try:
+        async with AlpacaClient() as client:
+            # Check if we can open new position
+            can_open, reasons = await risk_manager.can_open_new_position(
+                client, request.symbol, 0  # We'll calculate size below
+            )
+            
+            if not can_open:
+                return EnterTradeResponse(
+                    success=False,
+                    order_ids=[],
+                    symbol=request.symbol,
+                    quantity=0,
+                    entry_price=None,
+                    stop_loss_price=None,
+                    take_profit_price=None,
+                    position_size_info=None,
+                    message=f"Cannot open position: {', '.join(reasons)}",
+                    timestamp=timestamp
+                )
+            
+            # Get current price if not provided
+            entry_price = request.entry_price
+            if entry_price is None:
+                if request.order_type == "market":
+                    # For market orders, we'll use a placeholder price for position sizing
+                    # The actual execution price will be determined by the market
+                    try:
+                        latest_trade = await client.get_latest_trade(request.symbol)
+                        entry_price = latest_trade.get("p", 100.0)  # Fallback price
+                    except Exception:
+                        # If we can't get market data, use a reasonable default for position sizing
+                        entry_price = 100.0 if request.symbol in ["SPY", "QQQ"] else 150.0
+                        logger.warning(f"Could not get market price for {request.symbol}, using fallback: ${entry_price}")
+                else:
+                    raise HTTPException(status_code=400, detail="Entry price required for limit orders")
+            
+            # Calculate position size if quantity not provided
+            quantity = request.quantity
+            position_size_info = None
+            
+            if quantity is None:
+                account = await client.get_account()
+                
+                # Get ATR for dynamic stop loss
+                atr_value = None
+                if request.symbol in indicator_managers:
+                    indicators = indicator_managers[request.symbol].get_current_values()
+                    atr_value = indicators.get("atr")
+                
+                position_size_info = risk_manager.shares_for_trade(
+                    symbol=request.symbol,
+                    entry_price=entry_price,
+                    stop_loss_price=request.stop_loss_price,
+                    portfolio_value=account.portfolio_value,
+                    risk_percent=request.risk_percent,
+                    atr_value=atr_value
+                )
+                
+                quantity = position_size_info.recommended_shares
+            
+            # Determine if we should use bracket order or simple order
+            stop_loss_price = request.stop_loss_price or (position_size_info.stop_loss_price if position_size_info else None)
+            take_profit_price = request.take_profit_price or (position_size_info.take_profit_price if position_size_info else None)
+            
+            if stop_loss_price and take_profit_price:
+                # Submit bracket order with both stop and target
+                orders = await client.submit_bracket_order(
+                    symbol=request.symbol,
+                    qty=quantity,
+                    side=request.side,
+                    limit_price=entry_price if request.order_type == "limit" else None,
+                    stop_loss_price=stop_loss_price,
+                    take_profit_price=take_profit_price,
+                    time_in_force=request.time_in_force
+                )
+            else:
+                # Submit simple order
+                order = await client.submit_order(
+                    symbol=request.symbol,
+                    qty=quantity,
+                    side=request.side,
+                    order_type=request.order_type,
+                    limit_price=entry_price if request.order_type == "limit" else None,
+                    time_in_force=request.time_in_force
+                )
+                orders = [order]
+            
+            order_ids = [order.id for order in orders]
+            
+            # Record trade event
+            trade_event = create_trade_event(
+                event_type="entry",
+                symbol=request.symbol,
+                price=entry_price,
+                quantity=quantity,
+                side=request.side,
+                order_id=order_ids[0] if order_ids else None,
+                reason="bracket_order"
+            )
+            trade_log.append(trade_event)
+            
+            # Update trade counter
+            risk_manager.update_trade_count()
+            
+            return EnterTradeResponse(
+                success=True,
+                order_ids=order_ids,
+                symbol=request.symbol,
+                quantity=quantity,
+                entry_price=entry_price,
+                stop_loss_price=request.stop_loss_price or (position_size_info.stop_loss_price if position_size_info else None),
+                take_profit_price=request.take_profit_price or (position_size_info.take_profit_price if position_size_info else None),
+                position_size_info=position_size_info,
+                message=f"Successfully submitted bracket order for {quantity} shares of {request.symbol}",
+                timestamp=timestamp
+            )
+    
+    except Exception as e:
+        logger.error(f"Error entering trade: {str(e)}")
+        return EnterTradeResponse(
+            success=False,
+            order_ids=[],
+            symbol=request.symbol,
+            quantity=0,
+            entry_price=None,
+            stop_loss_price=None,
+            take_profit_price=None,
+            position_size_info=None,
+            message=f"Error: {str(e)}",
+            timestamp=timestamp
+        )
+
+
+@app.post("/tools/manage_trade", response_model=ManageTradeResponse)
+async def manage_trade(request: ManageTradeRequest):
+    """Adjust stop loss, trail stop, or exit partial position."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    try:
+        async with AlpacaClient() as client:
+            new_orders = []
+            cancelled_orders = []
+            
+            if request.action == "adjust_stop":
+                # Cancel existing stop orders and create new one
+                orders = await client.get_orders(status="open")
+                symbol_orders = [o for o in orders if o.symbol == request.symbol and o.order_type == "stop"]
+                
+                for order in symbol_orders:
+                    if await client.cancel_order(order.id):
+                        cancelled_orders.append(order.id)
+                
+                # Create new stop order
+                position = await client.get_position(request.symbol)
+                if position:
+                    side = "sell" if float(position.qty) > 0 else "buy"
+                    new_order = await client.submit_order(
+                        symbol=request.symbol,
+                        qty=abs(float(position.qty)),
+                        side=side,
+                        order_type="stop",
+                        stop_price=request.new_stop_price
+                    )
+                    new_orders.append(new_order.id)
+            
+            elif request.action == "trail_stop":
+                # Implement trailing stop logic
+                orders = await client.get_orders(status="open")
+                symbol_orders = [o for o in orders if o.symbol == request.symbol and "stop" in o.order_type]
+                
+                for order in symbol_orders:
+                    if await client.cancel_order(order.id):
+                        cancelled_orders.append(order.id)
+                
+                position = await client.get_position(request.symbol)
+                if position:
+                    side = "sell" if float(position.qty) > 0 else "buy"
+                    new_order = await client.submit_order(
+                        symbol=request.symbol,
+                        qty=abs(float(position.qty)),
+                        side=side,
+                        order_type="trailing_stop",
+                        trail_price=request.trail_amount
+                    )
+                    new_orders.append(new_order.id)
+            
+            elif request.action == "partial_exit":
+                # Exit partial position
+                position = await client.get_position(request.symbol)
+                if position:
+                    exit_qty = request.exit_quantity or abs(float(position.qty)) * 0.5
+                    side = "sell" if float(position.qty) > 0 else "buy"
+                    
+                    new_order = await client.submit_order(
+                        symbol=request.symbol,
+                        qty=exit_qty,
+                        side=side,
+                        order_type="market"
+                    )
+                    new_orders.append(new_order.id)
+                    
+                    # Record trade event
+                    latest_trade = await client.get_latest_trade(request.symbol)
+                    trade_event = create_trade_event(
+                        event_type="partial_exit",
+                        symbol=request.symbol,
+                        price=latest_trade.get("p", 0),
+                        quantity=exit_qty,
+                        side=side,
+                        order_id=new_order.id,
+                        reason="manual_partial_exit"
+                    )
+                    trade_log.append(trade_event)
+            
+            return ManageTradeResponse(
+                success=True,
+                symbol=request.symbol,
+                action=request.action,
+                message=f"Successfully executed {request.action} for {request.symbol}",
+                new_orders=new_orders,
+                cancelled_orders=cancelled_orders,
+                timestamp=timestamp
+            )
+    
+    except Exception as e:
+        logger.error(f"Error managing trade: {str(e)}")
+        return ManageTradeResponse(
+            success=False,
+            symbol=request.symbol,
+            action=request.action,
+            message=f"Error: {str(e)}",
+            new_orders=[],
+            cancelled_orders=[],
+            timestamp=timestamp
+        )
+
+
+@app.post("/tools/close_symbol")
+async def close_symbol(request: CloseSymbolRequest):
+    """Idempotent close with verification."""
+    try:
+        async with AlpacaClient() as client:
+            result = await close_with_verification(
+                client, 
+                request.symbol, 
+                request.quantity
+            )
+            
+            # Record trade event if successful
+            if result.success and result.close_price:
+                trade_event = create_trade_event(
+                    event_type="exit",
+                    symbol=request.symbol,
+                    price=result.close_price,
+                    quantity=result.closed_qty,
+                    side="sell" if result.initial_qty > 0 else "buy",
+                    reason="manual_close"
+                )
+                trade_log.append(trade_event)
+            
+            return result.dict()
+    
+    except Exception as e:
+        logger.error(f"Error closing symbol: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/flat_all")
+async def flat_all():
+    """Flatten all positions and cancel open orders."""
+    try:
+        async with AlpacaClient() as client:
+            result = await flatten_all_positions(client)
+            
+            # Record trade events for each closed position
+            if result.get("success"):
+                for close_result in result.get("close_results", []):
+                    if close_result.get("success") and close_result.get("close_price"):
+                        trade_event = create_trade_event(
+                            event_type="exit",
+                            symbol=close_result["symbol"],
+                            price=close_result["close_price"],
+                            quantity=close_result["closed_qty"],
+                            side="sell" if close_result["initial_qty"] > 0 else "buy",
+                            reason="flatten_all"
+                        )
+                        trade_log.append(trade_event)
+            
+            return result
+    
+    except Exception as e:
+        logger.error(f"Error flattening all positions: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tools/healthcheck", response_model=HealthCheckResponse)
+async def healthcheck():
+    """Check account, clock, and connectivity."""
+    try:
+        async with AlpacaClient() as client:
+            health_data = await client.health_check()
+            
+            return HealthCheckResponse(
+                status=health_data["status"],
+                account_status=health_data.get("account_status", "unknown"),
+                market_open=health_data.get("market_open", False),
+                buying_power=health_data.get("buying_power", 0),
+                portfolio_value=health_data.get("portfolio_value", 0),
+                timestamp=health_data["timestamp"],
+                config_valid=validate_config()
+            )
+    
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return HealthCheckResponse(
+            status="unhealthy",
+            account_status="error",
+            market_open=False,
+            buying_power=0,
+            portfolio_value=0,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            config_valid=False
+        )
+
+
+@app.get("/tools/risk_status", response_model=RiskStatusResponse)
+async def risk_status():
+    """Return P&L and drawdown counters."""
+    try:
+        async with AlpacaClient() as client:
+            risk_metrics = await risk_manager.get_risk_metrics(client)
+            portfolio_heat = await risk_manager.get_portfolio_heat(client)
+            
+            return RiskStatusResponse(
+                portfolio_value=risk_metrics.portfolio_value,
+                daily_pnl=risk_metrics.daily_pnl,
+                daily_pnl_percent=risk_metrics.daily_pnl_percent,
+                max_daily_loss_percent=settings.max_daily_loss * 100,
+                total_exposure=risk_metrics.total_exposure,
+                positions_count=risk_metrics.positions_count,
+                risk_level=risk_metrics.risk_level,
+                portfolio_heat=portfolio_heat,
+                timestamp=datetime.now(timezone.utc).isoformat()
+            )
+    
+    except Exception as e:
+        logger.error(f"Error getting risk status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/record_trade")
+async def record_trade(request: RecordTradeRequest):
+    """Log structured trade events."""
+    try:
+        trade_event = create_trade_event(
+            event_type=request.event_type,
+            symbol=request.symbol,
+            price=request.price,
+            quantity=request.quantity,
+            side=request.side,
+            order_id=request.order_id,
+            pnl=request.pnl,
+            reason=request.reason,
+            **request.metadata
+        )
+        
+        trade_log.append(trade_event)
+        
+        return {
+            "success": True,
+            "message": f"Recorded {request.event_type} event for {request.symbol}",
+            "event_id": len(trade_log) - 1,
+            "timestamp": trade_event.timestamp
+        }
+    
+    except Exception as e:
+        logger.error(f"Error recording trade: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Additional utility endpoints
+
+@app.get("/trade_log")
+async def get_trade_log(limit: int = 100):
+    """Get recent trade events."""
+    return {
+        "events": trade_log[-limit:],
+        "total_events": len(trade_log)
+    }
+
+
+@app.get("/positions")
+async def get_positions():
+    """Get current positions."""
+    try:
+        async with AlpacaClient() as client:
+            positions = await client.get_positions()
+            return [pos.dict() for pos in positions]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/orders")
+async def get_orders(status: str = "open"):
+    """Get orders by status."""
+    try:
+        async with AlpacaClient() as client:
+            orders = await client.get_orders(status=status)
+            return [order.dict() for order in orders]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/account")
+async def get_account():
+    """Get account information."""
+    try:
+        async with AlpacaClient() as client:
+            account = await client.get_account()
+            return account.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Background tasks
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the application."""
+    logger.info("Starting DayBot MCP Server")
+    
+    # Validate configuration
+    if not validate_config():
+        logger.error("Invalid configuration - check environment variables")
+    
+    # Reset daily counters
+    risk_manager.reset_daily_counters()
+    
+    logger.info(f"Server started on {settings.server_host}:{settings.server_port}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up on shutdown."""
+    logger.info("Shutting down DayBot MCP Server")
+
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with server information."""
+    return {
+        "name": "DayBot MCP Server",
+        "version": "1.0.0",
+        "description": "MCP tool server for algorithmic trading with Alpaca",
+        "status": "running",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "endpoints": [
+            "/tools/scan_symbols",
+            "/tools/enter_trade", 
+            "/tools/manage_trade",
+            "/tools/close_symbol",
+            "/tools/flat_all",
+            "/tools/healthcheck",
+            "/tools/risk_status",
+            "/tools/record_trade"
+        ]
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "daybot_mcp.server:app",
+        host=settings.server_host,
+        port=settings.server_port,
+        reload=settings.debug_mode
+    )

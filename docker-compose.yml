@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  daybot-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
+      - MAX_POSITION_SIZE=${MAX_POSITION_SIZE:-0.02}
+      - MAX_DAILY_LOSS=${MAX_DAILY_LOSS:-0.05}
+      - DEFAULT_STOP_LOSS=${DEFAULT_STOP_LOSS:-0.02}
+      - DEFAULT_TAKE_PROFIT=${DEFAULT_TAKE_PROFIT:-0.04}
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/tools/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
