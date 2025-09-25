@@ -25,6 +25,8 @@ from daybot_mcp.audit_logger import (
 )
 from daybot_mcp.indicators import IndicatorManager, ATR
 from daybot_mcp.risk import RiskManager
+from daybot_mcp.correlation_controls import CorrelationLimits
+from daybot_mcp.websocket_client import RealTimeDataService, StreamType, Quote, Trade
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,15 +50,35 @@ class MomentumStrategy:
         self.risk_per_trade = 0.02  # 2% risk per trade
         self.running = False
         self.audit_logger = None
-        self.risk_manager = RiskManager()
+        # Initialize risk manager with correlation controls
+        correlation_limits = CorrelationLimits(
+            max_positions_per_sector=2,      # Max 2 positions per sector
+            max_sector_exposure_percent=30.0, # Max 30% in any sector
+            max_beta_weighted_exposure=1.5,   # Limit market exposure
+            max_high_beta_positions=3,        # Max 3 high-beta positions
+            correlation_threshold=0.7,        # Consider 0.7+ as highly correlated
+            max_correlated_positions=2        # Max 2 highly correlated positions
+        )
+        self.risk_manager = RiskManager(correlation_limits)
         self.indicators = {}  # Store IndicatorManager instances per symbol
         self.use_atr_stops = True  # Enable ATR-based dynamic stops
+        
+        # Real-time data service
+        self.realtime_service = RealTimeDataService()
+        self.use_realtime_data = True
+        self.monitored_symbols = set()
+        
+        # Real-time price tracking
+        self.current_prices = {}
+        self.price_momentum = {}  # Track price momentum for signals
     
     async def __aenter__(self):
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.client.aclose()
+        if self.use_realtime_data:
+            await self.realtime_service.stop()
     
     async def get_health(self) -> Dict[str, Any]:
         """Check system health."""
@@ -120,6 +142,115 @@ class MomentumStrategy:
         except Exception:
             return None
     
+    def setup_realtime_callbacks(self):
+        """Setup callbacks for real-time market data."""
+        # Register quote handler for all monitored symbols
+        for symbol in self.monitored_symbols:
+            self.realtime_service.data_manager.subscribe_quotes(symbol, self._on_quote_update)
+            self.realtime_service.data_manager.subscribe_trades(symbol, self._on_trade_update)
+    
+    def _on_quote_update(self, quote: Quote):
+        """Handle real-time quote updates."""
+        symbol = quote.symbol
+        
+        # Update current price tracking
+        self.current_prices[symbol] = {
+            'mid_price': quote.mid_price,
+            'bid': quote.bid_price,
+            'ask': quote.ask_price,
+            'spread': quote.spread,
+            'spread_bps': quote.spread_bps,
+            'timestamp': quote.timestamp
+        }
+        
+        # Update indicators if we have this symbol
+        if symbol in self.indicators:
+            # Update indicators with new price data
+            bar_data = {
+                'h': quote.ask_price,
+                'l': quote.bid_price,
+                'c': quote.mid_price,
+                'v': 1000  # Placeholder volume
+            }
+            self.indicators[symbol].update(bar_data)
+        
+        # Check for momentum signals
+        self._check_momentum_signal(symbol, quote.mid_price)
+        
+        # Log high-frequency updates for audit
+        if self.audit_logger and symbol in self.positions:
+            self.audit_logger.log_strategy_event(
+                EventType.PRICE_UPDATE,
+                f"Real-time quote update for {symbol}",
+                "momentum_strategy",
+                symbol=symbol,
+                metadata={
+                    'mid_price': quote.mid_price,
+                    'spread_bps': quote.spread_bps,
+                    'timestamp': quote.timestamp.isoformat()
+                }
+            )
+    
+    def _on_trade_update(self, trade: Trade):
+        """Handle real-time trade updates."""
+        symbol = trade.symbol
+        
+        # Update price momentum tracking
+        if symbol not in self.price_momentum:
+            self.price_momentum[symbol] = {'prices': [], 'timestamps': []}
+        
+        # Keep last 20 trades for momentum calculation
+        self.price_momentum[symbol]['prices'].append(trade.price)
+        self.price_momentum[symbol]['timestamps'].append(trade.timestamp)
+        
+        if len(self.price_momentum[symbol]['prices']) > 20:
+            self.price_momentum[symbol]['prices'].pop(0)
+            self.price_momentum[symbol]['timestamps'].pop(0)
+        
+        # Check for breakout patterns
+        self._check_breakout_signal(symbol, trade.price, trade.size)
+    
+    def _check_momentum_signal(self, symbol: str, current_price: float):
+        """Check for momentum signals based on real-time price action."""
+        if symbol not in self.price_momentum or len(self.price_momentum[symbol]['prices']) < 10:
+            return
+        
+        prices = self.price_momentum[symbol]['prices']
+        
+        # Calculate short-term momentum (last 5 vs previous 5 trades)
+        if len(prices) >= 10:
+            recent_avg = sum(prices[-5:]) / 5
+            previous_avg = sum(prices[-10:-5]) / 5
+            
+            momentum_pct = ((recent_avg - previous_avg) / previous_avg) * 100
+            
+            # Strong momentum signal threshold
+            if abs(momentum_pct) > 0.5:  # 0.5% momentum
+                if self.audit_logger:
+                    self.audit_logger.log_strategy_event(
+                        EventType.MOMENTUM_SIGNAL,
+                        f"Momentum signal detected for {symbol}: {momentum_pct:.2f}%",
+                        "momentum_strategy",
+                        symbol=symbol,
+                        metadata={
+                            'momentum_pct': momentum_pct,
+                            'current_price': current_price,
+                            'recent_avg': recent_avg,
+                            'previous_avg': previous_avg
+                        }
+                    )
+    
+    def _check_breakout_signal(self, symbol: str, price: float, volume: int):
+        """Check for volume-weighted breakout signals."""
+        # Placeholder for sophisticated breakout detection
+        # In a real implementation, this would analyze:
+        # - Volume spikes
+        # - Price level breaks
+        # - Technical indicator confirmations
+        
+        if volume > 10000:  # High volume threshold
+            logger.info(f"High volume trade detected: {symbol} @ ${price:.2f} (vol: {volume:,})")
+    
     async def enter_trade(self, symbol: str, side: str = "buy") -> Dict[str, Any]:
         """Enter a new trade with risk management."""
         if self.audit_logger:
@@ -141,8 +272,8 @@ class MomentumStrategy:
             if self.use_atr_stops:
                 atr_value = await self.get_symbol_atr(symbol)
                 if atr_value:
-                    # Get current price (simplified - in real implementation get from market data)
-                    entry_price = 100.0  # Placeholder - would get real price
+                    # Get current price from real-time data or fallback
+                    entry_price = self.realtime_service.get_current_price(symbol) or 100.0
                     
                     # Calculate ATR-based position size
                     position_result = self.risk_manager.calculate_atr_position_size(
@@ -427,11 +558,39 @@ class MomentumStrategy:
             )
             self.audit_logger = get_audit_logger()
         
-        logger.info("🚀 Starting Momentum Strategy with ATR-Based Dynamic Stops")
+        logger.info("🚀 Starting Momentum Strategy with Real-Time Data & Advanced Risk Controls")
         logger.info(f"Max positions: {self.max_positions}")
         logger.info(f"Risk per trade: {self.risk_per_trade * 100:.1f}%")
         logger.info(f"ATR-based stops: {'Enabled' if self.use_atr_stops else 'Disabled'}")
+        logger.info(f"Real-time data: {'Enabled' if self.use_realtime_data else 'Disabled'}")
+        logger.info(f"Max positions per sector: {self.risk_manager.correlation_manager.limits.max_positions_per_sector}")
+        logger.info(f"Max sector exposure: {self.risk_manager.correlation_manager.limits.max_sector_exposure_percent}%")
+        logger.info(f"Max beta-weighted exposure: {self.risk_manager.correlation_manager.limits.max_beta_weighted_exposure}")
         logger.info(f"Cycle interval: {cycle_interval} seconds")
+        
+        # Initialize real-time data if enabled
+        if self.use_realtime_data:
+            try:
+                # Get initial symbol list for monitoring
+                symbols = await self.scan_symbols()
+                self.monitored_symbols.update(symbols[:10])  # Monitor top 10 symbols
+                
+                logger.info(f"📡 Starting real-time data for {len(self.monitored_symbols)} symbols")
+                await self.realtime_service.start(
+                    list(self.monitored_symbols), 
+                    [StreamType.QUOTES, StreamType.TRADES]
+                )
+                
+                # Setup callbacks
+                self.setup_realtime_callbacks()
+                
+                logger.info("✅ Real-time market data connected successfully")
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to start real-time data: {e}")
+                logger.info("📊 Falling back to REST-only mode")
+                self.use_realtime_data = False
+        
         logger.info("⚠️  Using conservative rate limiting to avoid API limits")
         
         if self.audit_logger:

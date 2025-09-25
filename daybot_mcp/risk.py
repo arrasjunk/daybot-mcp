@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from .config import settings
 from .alpaca_client import AlpacaClient, Account, Position
+from .correlation_controls import CorrelationManager, CorrelationLimits
 
 
 class RiskMetrics(BaseModel):
@@ -42,11 +43,12 @@ class PositionSizeResult(BaseModel):
 class RiskManager:
     """Manages risk and position sizing for the trading account."""
     
-    def __init__(self):
+    def __init__(self, correlation_limits: Optional[CorrelationLimits] = None):
         self.daily_start_equity: Optional[float] = None
         self.max_drawdown_today: float = 0.0
         self.trade_count_today: int = 0
         self.last_reset_date: Optional[str] = None
+        self.correlation_manager = CorrelationManager(correlation_limits)
     
     async def get_risk_metrics(self, alpaca_client: AlpacaClient) -> RiskMetrics:
         """Calculate current risk metrics for the account."""
@@ -271,7 +273,7 @@ class RiskManager:
         position_size_dollars: float
     ) -> Tuple[bool, List[str]]:
         """
-        Check if a new position can be opened based on risk rules.
+        Check if a new position can be opened based on risk rules including correlation controls.
         
         Returns:
             (can_open, reasons_if_not)
@@ -305,6 +307,22 @@ class RiskManager:
         existing_position = await alpaca_client.get_position(symbol)
         if existing_position:
             reasons.append(f"Already have position in {symbol}")
+        
+        # Check correlation and concentration controls
+        position_dicts = [
+            {
+                'symbol': pos.symbol,
+                'market_value': pos.market_value,
+                'qty': pos.qty
+            } for pos in positions
+        ]
+        
+        can_add_corr, corr_reasons = self.correlation_manager.can_add_position(
+            symbol, position_dicts, account.portfolio_value
+        )
+        
+        if not can_add_corr:
+            reasons.extend(corr_reasons)
         
         return len(reasons) == 0, reasons
     
@@ -351,6 +369,94 @@ class RiskManager:
             "max_heat_percent": settings.max_daily_loss * 100,
             "heat_status": "high" if portfolio_heat_percent > 15 else "medium" if portfolio_heat_percent > 8 else "low"
         }
+    
+    async def get_comprehensive_risk_analysis(self, alpaca_client: AlpacaClient) -> Dict[str, any]:
+        """
+        Get comprehensive risk analysis including correlation and concentration metrics.
+        
+        Returns:
+            Dictionary with all risk metrics including correlation analysis
+        """
+        account = await alpaca_client.get_account()
+        positions = await alpaca_client.get_positions()
+        
+        # Get basic risk metrics
+        risk_metrics = await self.get_risk_metrics(alpaca_client)
+        portfolio_heat = await self.get_portfolio_heat(alpaca_client)
+        
+        # Get correlation analysis
+        position_dicts = [
+            {
+                'symbol': pos.symbol,
+                'market_value': pos.market_value,
+                'qty': pos.qty
+            } for pos in positions
+        ]
+        
+        correlation_analysis = self.correlation_manager.analyze_portfolio_concentration(
+            position_dicts, account.portfolio_value
+        )
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "portfolio_value": account.portfolio_value,
+            "basic_risk_metrics": risk_metrics.dict(),
+            "portfolio_heat": portfolio_heat,
+            "correlation_analysis": correlation_analysis,
+            "overall_risk_level": self._calculate_overall_risk_level(
+                risk_metrics, portfolio_heat, correlation_analysis
+            )
+        }
+    
+    def _calculate_overall_risk_level(
+        self, 
+        risk_metrics: RiskMetrics, 
+        portfolio_heat: Dict[str, any], 
+        correlation_analysis: Dict[str, any]
+    ) -> str:
+        """Calculate overall portfolio risk level considering all factors."""
+        risk_score = 0
+        
+        # Basic risk factors
+        if risk_metrics.risk_level == "critical":
+            risk_score += 4
+        elif risk_metrics.risk_level == "high":
+            risk_score += 3
+        elif risk_metrics.risk_level == "medium":
+            risk_score += 2
+        
+        # Portfolio heat
+        heat_status = portfolio_heat.get("heat_status", "low")
+        if heat_status == "high":
+            risk_score += 3
+        elif heat_status == "medium":
+            risk_score += 2
+        
+        # Correlation warnings
+        warning_count = len(correlation_analysis.get("concentration_warnings", []))
+        if warning_count >= 3:
+            risk_score += 3
+        elif warning_count >= 2:
+            risk_score += 2
+        elif warning_count >= 1:
+            risk_score += 1
+        
+        # Beta-weighted exposure
+        beta_exposure = correlation_analysis.get("beta_weighted_exposure", 0)
+        if beta_exposure > 1.5:
+            risk_score += 2
+        elif beta_exposure > 1.2:
+            risk_score += 1
+        
+        # Determine overall level
+        if risk_score >= 8:
+            return "critical"
+        elif risk_score >= 6:
+            return "high"
+        elif risk_score >= 3:
+            return "medium"
+        else:
+            return "low"
     
     def calculate_atr_position_size(
         self,
