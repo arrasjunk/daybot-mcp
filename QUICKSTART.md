@@ -33,6 +33,21 @@ MAX_POSITION_SIZE=0.02      # 2% of portfolio per position
 MAX_DAILY_LOSS=0.05         # 5% daily loss limit
 DEFAULT_STOP_LOSS=0.02      # 2% default stop loss
 DEFAULT_TAKE_PROFIT=0.04    # 4% default take profit
+
+# Adaptive sizing (optional)
+DEFAULT_RISK_PER_TRADE=0.01     # 1% portfolio risk per trade (separate from stop loss)
+RISK_SIZING_MODE=fixed          # fixed|volatility|kelly|conviction|hybrid
+FRACTIONAL_KELLY_MULTIPLIER=0.5 # Fraction of Kelly to use
+KELLY_CAP=0.2                   # Maximum Kelly fraction
+HYBRID_KELLY_WEIGHT=0.3         # Weight for Kelly in hybrid mode
+RISK_FLOOR=0.002                # Minimum risk per trade (0.2%)
+RISK_CEILING=0.02               # Maximum risk per trade (2%)
+CONVICTION_MIN_MULTIPLIER=0.5   # Multiplier at lowest conviction
+CONVICTION_MAX_MULTIPLIER=1.5   # Multiplier at highest conviction
+HEAT_SCALING_ENABLED=true       # Downscale risk as portfolio heat rises
+HEAT_MIN_MULTIPLIER=0.3         # Minimum scaling at high heat
+LOW_VOLATILITY_MULTIPLIER=1.2   # Risk up-weight in low vol regimes
+HIGH_VOLATILITY_MULTIPLIER=0.7  # Risk down-weight in high vol regimes
 ```
 
 ## 3. Start the Server
@@ -179,6 +194,16 @@ open http://localhost:8000/dashboard/
 
 See `ANALYTICS_README.md` for detailed documentation and examples.
 
+#### Position Sizing: Kelly Inputs (NEW!)
+
+Use analytics-derived Kelly inputs to inform adaptive position sizing. The server can auto-populate Kelly stats when `sizing_mode` is `kelly` or `hybrid`, or you can query them directly:
+
+```bash
+curl "http://localhost:8000/analytics/kelly_inputs?start_date=2024-01-01&end_date=2024-12-31&strategy=momentum&symbol=AAPL"
+```
+
+Response includes: `win_rate`, `avg_win`, `avg_loss`, `kelly_fraction`, `fractional_kelly`, and `recommended_risk_fraction` (bounded by your global risk floor/ceiling).
+
 ## 7. Safety Features
 
 - **Daily Loss Limits**: Trading stops when daily loss exceeds threshold
@@ -202,6 +227,57 @@ for symbol in symbols["symbols"][:5]:
         "risk_percent": 0.01,  # 1% risk per trade
         "order_type": "market"
     })
+```
+
+### Adaptive Sizing Examples
+```bash
+# Volatility-scaled sizing using ATR (server uses latest indicator values)
+curl -X POST http://localhost:8000/tools/enter_trade \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "AAPL",
+    "side": "buy",
+    "order_type": "market",
+    "sizing_mode": "volatility"
+  }'
+
+# Conviction-based sizing (0..1 or 1..5 scale)
+curl -X POST http://localhost:8000/tools/enter_trade \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "NVDA",
+    "side": "buy",
+    "order_type": "market",
+    "sizing_mode": "conviction",
+    "conviction": 0.8
+  }'
+
+# Fractional Kelly sizing (supply win rate and average P/L)
+curl -X POST http://localhost:8000/tools/enter_trade \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "QQQ",
+    "side": "buy",
+    "order_type": "market",
+    "sizing_mode": "kelly",
+    "kelly_win_rate": 58.0,
+    "kelly_avg_win": 120.0,
+    "kelly_avg_loss": -80.0
+  }'
+
+# Hybrid sizing (volatility x conviction, blended with Kelly)
+curl -X POST http://localhost:8000/tools/enter_trade \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "SPY",
+    "side": "buy",
+    "order_type": "market",
+    "sizing_mode": "hybrid",
+    "conviction": 4,
+    "kelly_win_rate": 55.0,
+    "kelly_avg_win": 100.0,
+    "kelly_avg_loss": -70.0
+  }'
 ```
 
 ### Risk Management

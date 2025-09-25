@@ -150,6 +150,16 @@ curl -X POST "http://localhost:8000/analytics/sync"
 - `GET /analytics/strategy/{strategy_name}` - Specific strategy analysis
 - Parameters: `strategy`, `start_date`, `end_date`
 
+### Position Sizing
+- `GET /analytics/kelly_inputs` - Kelly inputs and recommended fractional Kelly risk
+  - Parameters: `start_date`, `end_date`, `strategy`, `symbol` (all optional)
+  - Returns: `win_rate`, `avg_win`, `avg_loss`, `kelly_fraction`, `fractional_kelly`, `recommended_risk_fraction`, `trades_analyzed`
+
+Example:
+```bash
+curl "http://localhost:8000/analytics/kelly_inputs?start_date=2024-01-01&end_date=2024-12-31&strategy=momentum&symbol=AAPL"
+```
+
 ### Dashboard
 - `GET /dashboard/` - Interactive web dashboard
 - `GET /dashboard/api/performance` - Dashboard data API

@@ -133,6 +133,21 @@ DEBUG_MODE=false
 # Trading Configuration (Optional)
 MARKET_OPEN_BUFFER=5        # Minutes after market open
 MARKET_CLOSE_BUFFER=15      # Minutes before market close
+
+# Adaptive Sizing (Optional)
+DEFAULT_RISK_PER_TRADE=0.01     # 1% portfolio risk per trade
+RISK_SIZING_MODE=fixed          # fixed|volatility|kelly|conviction|hybrid
+FRACTIONAL_KELLY_MULTIPLIER=0.5 # Fraction of Kelly to use
+KELLY_CAP=0.2                   # Maximum Kelly fraction
+HYBRID_KELLY_WEIGHT=0.3         # Kelly blend weight in hybrid mode
+RISK_FLOOR=0.002                # Minimum risk per trade (0.2%)
+RISK_CEILING=0.02               # Maximum risk per trade (2%)
+CONVICTION_MIN_MULTIPLIER=0.5   # Multiplier at lowest conviction
+CONVICTION_MAX_MULTIPLIER=1.5   # Multiplier at highest conviction
+HEAT_SCALING_ENABLED=true       # Downscale risk as portfolio heat rises
+HEAT_MIN_MULTIPLIER=0.3         # Minimum scaling at high heat
+LOW_VOLATILITY_MULTIPLIER=1.2   # Risk up-weight in low vol regimes
+HIGH_VOLATILITY_MULTIPLIER=0.7  # Risk down-weight in high vol regimes
 ```
 
 ## Usage
@@ -188,6 +203,7 @@ python dev_server.py --reload
 - `GET /analytics/strategy/{strategy_name}` - Analyze a specific strategy
 - `GET /analytics/trades` - Trade data with filtering (symbol, strategy, dates)
 - `POST /analytics/sync` - Parse audit logs and sync trades into analytics DB
+- `GET /analytics/kelly_inputs` - Kelly inputs and recommended fractional Kelly risk
 
 For detailed examples and output formats, refer to `ANALYTICS_README.md`.
 

@@ -87,20 +87,22 @@ async def close_with_verification(
         # Submit close order
         close_order = await alpaca_client.close_position(symbol, qty)
         close_price = None
+        attempts_done = 0
         
         # Verification loop
         for attempt in range(max_attempts):
+            attempts_done = attempt + 1
             await asyncio.sleep(verification_delay)
             
-            # Check current position
+            # First check if order was filled
+            order_status = await alpaca_client.get_order(close_order.id)
+            if order_status and getattr(order_status, "status", None) == "filled":
+                close_price = getattr(order_status, "filled_avg_price", None)
+                break
+            
+            # If not filled yet, check current position state
             current_position = await alpaca_client.get_position(symbol)
             current_qty = float(current_position.qty) if current_position else 0.0
-            
-            # Check if order was filled
-            order_status = await alpaca_client.get_order(close_order.id)
-            if order_status and order_status.status == "filled":
-                close_price = order_status.filled_avg_price
-                break
             
             # If position is closed or reduced as expected, consider it successful
             if qty is None and current_qty == 0:
@@ -125,7 +127,7 @@ async def close_with_verification(
             remaining_qty=final_qty,
             close_price=close_price,
             orders_cancelled=orders_cancelled,
-            verification_attempts=max_attempts,
+            verification_attempts=attempts_done,
             error_message=None if success else "Position not fully closed as expected",
             timestamp=timestamp
         )
@@ -188,7 +190,11 @@ async def flatten_all_positions(alpaca_client: AlpacaClient) -> Dict[str, Any]:
         # Close all positions
         close_results = []
         for position in positions:
-            result = await close_with_verification(alpaca_client, position.symbol)
+            maybe = close_with_verification(alpaca_client, position.symbol)
+            if asyncio.iscoroutine(maybe):
+                result = await maybe
+            else:
+                result = maybe
             close_results.append(result)
         
         successful_closes = sum(1 for result in close_results if result.success)
