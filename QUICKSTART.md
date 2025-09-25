@@ -20,8 +20,8 @@ Update your `.env` file with real credentials:
 
 ```bash
 # Replace these with your actual Alpaca API keys
-ALPACA_API_KEY=PKT1P9XSC7JH2TOA2FFH
-ALPACA_SECRET_KEY=GK7a3DBdrZjUI0SyzjpvvKhLzxf6uWdPg47WpQmA
+ALPACA_API_KEY=your_alpaca_api_key_here
+ALPACA_SECRET_KEY=your_alpaca_secret_key_here
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 
 # Adjust risk settings as needed
@@ -116,6 +116,39 @@ curl http://localhost:8000/trade_log
 ### Account Status
 ```bash
 curl http://localhost:8000/account
+```
+
+### 📊 Comprehensive Audit Logging (NEW!)
+
+DayBot now includes a comprehensive logging system for detailed audit trails:
+
+```bash
+# Get daily trading report
+curl http://localhost:8000/audit/daily_report
+
+# Get trading performance metrics
+curl "http://localhost:8000/audit/trading_metrics?start_date=2024-01-01&end_date=2024-01-31"
+
+# Get system performance metrics
+curl http://localhost:8000/audit/system_metrics
+
+# Get error summary
+curl http://localhost:8000/audit/error_summary
+
+# Get performance by symbol
+curl http://localhost:8000/audit/symbol_performance
+```
+
+**Log Files Location**: `logs/`
+- `audit.log` - All events (comprehensive)
+- `trades.log` - Trading-specific events  
+- `system.log` - System events
+- `errors.log` - Error events only
+- `performance.log` - Performance metrics
+
+**Try the logging demo**:
+```bash
+python examples/logging_example.py
 ```
 
 ## 7. Safety Features

@@ -21,6 +21,14 @@ from .utils import (
     TradeEvent
 )
 from .indicators import IndicatorManager
+from .audit_logger import (
+    initialize_audit_logger, 
+    get_audit_logger, 
+    close_audit_logger,
+    EventType,
+    LogLevel
+)
+from .log_analyzer import LogAnalyzer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +54,7 @@ app.add_middleware(
 risk_manager = RiskManager()
 indicator_managers: Dict[str, IndicatorManager] = {}
 trade_log: List[TradeEvent] = []
+log_analyzer: Optional[LogAnalyzer] = None
 
 
 # Pydantic models for request/response
@@ -164,6 +173,15 @@ async def scan_symbols(request: ScanSymbolsRequest):
     Scan for symbols based on criteria.
     Currently returns a stubbed watchlist - extend with actual scanner later.
     """
+    # Log symbol scan event
+    audit_logger = get_audit_logger()
+    audit_logger.log_strategy_event(
+        EventType.SYMBOL_SCAN,
+        f"Symbol scan requested with criteria: {request.dict()}",
+        "scanner",
+        metadata=request.dict()
+    )
+    
     # Stubbed implementation - replace with actual scanner
     watchlist = [
         "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",
@@ -178,6 +196,13 @@ async def scan_symbols(request: ScanSymbolsRequest):
         # In a real implementation, you would filter by actual prices
         pass
     
+    audit_logger.log_strategy_event(
+        EventType.SYMBOL_SCAN,
+        f"Symbol scan completed, found {len(filtered_symbols)} symbols",
+        "scanner",
+        metadata={"symbol_count": len(filtered_symbols), "symbols": filtered_symbols}
+    )
+    
     return ScanSymbolsResponse(
         symbols=filtered_symbols,
         scan_time=datetime.now(timezone.utc).isoformat(),
@@ -189,6 +214,16 @@ async def scan_symbols(request: ScanSymbolsRequest):
 async def enter_trade(request: EnterTradeRequest):
     """Submit bracket orders with stop loss and take profit."""
     timestamp = datetime.now(timezone.utc).isoformat()
+    audit_logger = get_audit_logger()
+    
+    # Log trade entry attempt
+    audit_logger.log_strategy_event(
+        EventType.ENTRY_SIGNAL,
+        f"Trade entry requested: {request.side} {request.symbol}",
+        "trading",
+        symbol=request.symbol,
+        metadata=request.dict()
+    )
     
     try:
         async with AlpacaClient() as client:
@@ -198,6 +233,11 @@ async def enter_trade(request: EnterTradeRequest):
             )
             
             if not can_open:
+                audit_logger.log_risk_event(
+                    EventType.RISK_LIMIT_HIT,
+                    f"Trade entry blocked for {request.symbol}: {', '.join(reasons)}",
+                    metadata={"symbol": request.symbol, "reasons": reasons}
+                )
                 return EnterTradeResponse(
                     success=False,
                     order_ids=[],
@@ -280,7 +320,24 @@ async def enter_trade(request: EnterTradeRequest):
             
             order_ids = [order.id for order in orders]
             
-            # Record trade event
+            # Log successful trade entry
+            audit_logger.log_trade_entry(
+                symbol=request.symbol,
+                side=request.side,
+                quantity=quantity,
+                price=entry_price,
+                order_id=order_ids[0] if order_ids else None,
+                strategy_name="manual",
+                risk_percent=request.risk_percent or 0.01,
+                metadata={
+                    "order_type": request.order_type,
+                    "stop_loss_price": stop_loss_price,
+                    "take_profit_price": take_profit_price,
+                    "position_size_info": position_size_info.dict() if position_size_info else None
+                }
+            )
+            
+            # Record trade event (legacy)
             trade_event = create_trade_event(
                 event_type="entry",
                 symbol=request.symbol,
@@ -310,6 +367,12 @@ async def enter_trade(request: EnterTradeRequest):
     
     except Exception as e:
         logger.error(f"Error entering trade: {str(e)}")
+        audit_logger.log_error(
+            f"Trade entry failed for {request.symbol}: {str(e)}",
+            "trading",
+            error=e,
+            metadata={"symbol": request.symbol, "request": request.dict()}
+        )
         return EnterTradeResponse(
             success=False,
             order_ids=[],
@@ -441,6 +504,20 @@ async def close_symbol(request: CloseSymbolRequest):
             
             # Record trade event if successful
             if result.success and result.close_price:
+                audit_logger.log_trade_exit(
+                    symbol=request.symbol,
+                    quantity=result.closed_qty,
+                    price=result.close_price,
+                    pnl=0.0,  # P&L would need to be calculated
+                    order_id="manual_close",
+                    reason="manual_close",
+                    metadata={
+                        "initial_qty": result.initial_qty,
+                        "remaining_qty": result.remaining_qty,
+                        "verification_attempts": result.verification_attempts
+                    }
+                )
+                
                 trade_event = create_trade_event(
                     event_type="exit",
                     symbol=request.symbol,
@@ -493,6 +570,14 @@ async def healthcheck():
         async with AlpacaClient() as client:
             health_data = await client.health_check()
             
+            # Log health check
+            audit_logger = get_audit_logger()
+            audit_logger.log_system_event(
+                EventType.HEALTH_CHECK,
+                f"Health check completed: {health_data['status']}",
+                metadata=health_data
+            )
+            
             return HealthCheckResponse(
                 status=health_data["status"],
                 account_status=health_data.get("account_status", "unknown"),
@@ -505,6 +590,12 @@ async def healthcheck():
     
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
+        audit_logger = get_audit_logger()
+        audit_logger.log_error(
+            f"Health check failed: {str(e)}",
+            "system",
+            error=e
+        )
         return HealthCheckResponse(
             status="unhealthy",
             account_status="error",
@@ -582,6 +673,233 @@ async def get_trade_log(limit: int = 100):
     }
 
 
+# Audit logging and analysis endpoints
+
+@app.get("/audit/daily_report")
+async def get_daily_report(date: Optional[str] = None):
+    """Get comprehensive daily trading report."""
+    try:
+        if not log_analyzer:
+            raise HTTPException(status_code=503, detail="Log analyzer not initialized")
+        
+        target_date = None
+        if date:
+            try:
+                target_date = datetime.fromisoformat(date).date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        
+        report = log_analyzer.generate_daily_report(target_date)
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit/trading_metrics")
+async def get_trading_metrics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get trading performance metrics for a date range."""
+    try:
+        if not log_analyzer:
+            raise HTTPException(status_code=503, detail="Log analyzer not initialized")
+        
+        start_dt = None
+        end_dt = None
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+        
+        metrics = log_analyzer.get_trading_metrics(start_dt, end_dt)
+        return metrics.__dict__
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit/system_metrics")
+async def get_system_metrics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get system performance metrics for a date range."""
+    try:
+        if not log_analyzer:
+            raise HTTPException(status_code=503, detail="Log analyzer not initialized")
+        
+        start_dt = None
+        end_dt = None
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+        
+        metrics = log_analyzer.get_system_metrics(start_dt, end_dt)
+        return metrics.__dict__
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit/risk_metrics")
+async def get_risk_metrics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get risk management metrics for a date range."""
+    try:
+        if not log_analyzer:
+            raise HTTPException(status_code=503, detail="Log analyzer not initialized")
+        
+        start_dt = None
+        end_dt = None
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+        
+        metrics = log_analyzer.get_risk_metrics(start_dt, end_dt)
+        return metrics.__dict__
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit/symbol_performance")
+async def get_symbol_performance(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get performance metrics by symbol."""
+    try:
+        if not log_analyzer:
+            raise HTTPException(status_code=503, detail="Log analyzer not initialized")
+        
+        start_dt = None
+        end_dt = None
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+        
+        performance = log_analyzer.get_symbol_performance(start_dt, end_dt)
+        return performance
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit/error_summary")
+async def get_error_summary(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """Get error and issue summary."""
+    try:
+        if not log_analyzer:
+            raise HTTPException(status_code=503, detail="Log analyzer not initialized")
+        
+        start_dt = None
+        end_dt = None
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+        
+        summary = log_analyzer.get_error_summary(start_dt, end_dt)
+        return summary
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/audit/export_logs")
+async def export_logs_csv(
+    output_file: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    event_types: Optional[List[str]] = None
+):
+    """Export logs to CSV format."""
+    try:
+        if not log_analyzer:
+            raise HTTPException(status_code=503, detail="Log analyzer not initialized")
+        
+        start_dt = None
+        end_dt = None
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+        
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+        
+        # Convert string event types to EventType enums
+        event_type_enums = None
+        if event_types:
+            try:
+                event_type_enums = [EventType(et) for et in event_types]
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid event type: {e}")
+        
+        log_analyzer.export_logs_to_csv(output_file, start_dt, end_dt, event_type_enums)
+        
+        return {
+            "success": True,
+            "message": f"Logs exported to {output_file}",
+            "export_params": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "event_types": event_types
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/positions")
 async def get_positions():
     """Get current positions."""
@@ -620,14 +938,40 @@ async def get_account():
 @app.on_event("startup")
 async def startup_event():
     """Initialize the application."""
+    global log_analyzer
+    
     logger.info("Starting DayBot MCP Server")
+    
+    # Initialize audit logging
+    initialize_audit_logger(
+        log_dir="logs",
+        environment=getattr(settings, 'environment', 'development')
+    )
+    
+    # Initialize log analyzer
+    log_analyzer = LogAnalyzer("logs")
     
     # Validate configuration
     if not validate_config():
         logger.error("Invalid configuration - check environment variables")
+        get_audit_logger().log_system_event(
+            EventType.SYSTEM_ERROR,
+            "Invalid configuration detected",
+            LogLevel.ERROR
+        )
     
     # Reset daily counters
     risk_manager.reset_daily_counters()
+    
+    get_audit_logger().log_system_event(
+        EventType.SYSTEM_START,
+        f"DayBot MCP Server started on {settings.server_host}:{settings.server_port}",
+        metadata={
+            "host": settings.server_host,
+            "port": settings.server_port,
+            "config_valid": validate_config()
+        }
+    )
     
     logger.info(f"Server started on {settings.server_host}:{settings.server_port}")
 
@@ -636,6 +980,16 @@ async def startup_event():
 async def shutdown_event():
     """Clean up on shutdown."""
     logger.info("Shutting down DayBot MCP Server")
+    
+    # Close audit logger
+    try:
+        get_audit_logger().log_system_event(
+            EventType.SYSTEM_STOP,
+            "DayBot MCP Server shutting down"
+        )
+        close_audit_logger()
+    except Exception as e:
+        logger.error(f"Error closing audit logger: {e}")
 
 
 # Root endpoint

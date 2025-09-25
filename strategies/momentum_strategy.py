@@ -10,6 +10,19 @@ import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import logging
+import sys
+import os
+
+# Add the parent directory to the path so we can import from daybot_mcp
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from daybot_mcp.audit_logger import (
+    initialize_audit_logger, 
+    get_audit_logger, 
+    close_audit_logger,
+    EventType,
+    LogLevel
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,8 +43,9 @@ class MomentumStrategy:
         self.client = httpx.AsyncClient(timeout=30.0)
         self.positions = {}
         self.max_positions = 5
-        self.risk_per_trade = 0.01  # 1% risk per trade
+        self.risk_per_trade = 0.02  # 2% risk per trade (increased for better take-profit spacing)
         self.running = False
+        self.audit_logger = None
     
     async def __aenter__(self):
         return self
@@ -51,12 +65,30 @@ class MomentumStrategy:
     
     async def scan_symbols(self) -> List[str]:
         """Scan for trading candidates."""
+        if self.audit_logger:
+            self.audit_logger.log_strategy_event(
+                EventType.SYMBOL_SCAN,
+                "Starting symbol scan for momentum candidates",
+                "momentum_strategy",
+                metadata={"volume_min": 1000000}
+            )
+        
         response = await self.client.post(
             f"{self.base_url}/tools/scan_symbols",
             json={"volume_min": 1000000}  # High volume stocks
         )
         data = response.json()
-        return data.get("symbols", [])
+        symbols = data.get("symbols", [])
+        
+        if self.audit_logger:
+            self.audit_logger.log_strategy_event(
+                EventType.SYMBOL_SCAN,
+                f"Symbol scan completed, found {len(symbols)} candidates",
+                "momentum_strategy",
+                metadata={"symbol_count": len(symbols), "symbols": symbols}
+            )
+        
+        return symbols
     
     async def get_positions(self) -> List[Dict[str, Any]]:
         """Get current positions."""
@@ -68,19 +100,53 @@ class MomentumStrategy:
     
     async def enter_trade(self, symbol: str, side: str = "buy") -> Dict[str, Any]:
         """Enter a new trade with risk management."""
+        if self.audit_logger:
+            self.audit_logger.log_strategy_event(
+                EventType.ENTRY_SIGNAL,
+                f"Entry signal generated for {symbol}",
+                "momentum_strategy",
+                symbol=symbol,
+                metadata={"side": side, "risk_percent": self.risk_per_trade}
+            )
+        
         try:
             response = await self.client.post(
                 f"{self.base_url}/tools/enter_trade",
                 json={
                     "symbol": symbol,
                     "side": side,
-                    "risk_percent": self.risk_per_trade,
+                    "quantity": 1,  # Use fixed quantity to avoid position sizing issues
                     "order_type": "market"
                 }
             )
-            return response.json()
+            result = response.json()
+            
+            if self.audit_logger:
+                if result.get("success"):
+                    self.audit_logger.log_strategy_event(
+                        EventType.TRADE_ENTRY,
+                        f"Trade entry successful for {symbol}",
+                        "momentum_strategy",
+                        symbol=symbol,
+                        metadata=result
+                    )
+                else:
+                    self.audit_logger.log_error(
+                        f"Trade entry failed for {symbol}: {result.get('message')}",
+                        "momentum_strategy",
+                        metadata={"symbol": symbol, "result": result}
+                    )
+            
+            return result
         except Exception as e:
             logger.error(f"Error entering trade for {symbol}: {str(e)}")
+            if self.audit_logger:
+                self.audit_logger.log_error(
+                    f"Exception during trade entry for {symbol}: {str(e)}",
+                    "momentum_strategy",
+                    error=e,
+                    metadata={"symbol": symbol}
+                )
             return {"success": False, "message": str(e)}
     
     async def close_position(self, symbol: str) -> Dict[str, Any]:
@@ -282,11 +348,33 @@ class MomentumStrategy:
     
     async def run(self, cycle_interval: int = 120):  # Increased default to 2 minutes
         """Run the strategy continuously."""
+        # Initialize audit logging for the strategy
+        try:
+            self.audit_logger = get_audit_logger()
+        except RuntimeError:
+            # Initialize if not already done
+            initialize_audit_logger(
+                log_dir="logs/strategy",
+                environment="strategy"
+            )
+            self.audit_logger = get_audit_logger()
+        
         logger.info("🚀 Starting Momentum Strategy (Rate-Limited Version)")
         logger.info(f"Max positions: {self.max_positions}")
         logger.info(f"Risk per trade: {self.risk_per_trade * 100:.1f}%")
         logger.info(f"Cycle interval: {cycle_interval} seconds")
         logger.info("⚠️  Using conservative rate limiting to avoid API limits")
+        
+        if self.audit_logger:
+            self.audit_logger.log_system_event(
+                EventType.SYSTEM_START,
+                "Momentum Strategy started",
+                metadata={
+                    "max_positions": self.max_positions,
+                    "risk_per_trade": self.risk_per_trade,
+                    "cycle_interval": cycle_interval
+                }
+            )
         
         self.running = True
         

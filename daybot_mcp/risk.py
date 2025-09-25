@@ -168,6 +168,13 @@ class RiskManager:
             warnings.append("Risk per share is zero - using minimum position")
             risk_per_share = entry_price * 0.01  # 1% fallback
         
+        # Ensure minimum risk per share for viable take-profit calculation
+        min_risk_per_share = 0.01  # Minimum $0.01 risk per share
+        if risk_per_share < min_risk_per_share:
+            risk_per_share = min_risk_per_share
+            stop_loss_price = entry_price - risk_per_share
+            warnings.append(f"Risk per share too small, adjusted to ${min_risk_per_share:.2f}")
+        
         # Calculate maximum risk amount
         max_risk_amount = portfolio_value * risk_percent
         max_position_value = portfolio_value * settings.max_position_size
@@ -193,6 +200,13 @@ class RiskManager:
         
         # Calculate take profit (default 2:1 risk/reward)
         take_profit_price = entry_price + (2 * risk_per_share)
+        
+        # Ensure minimum $0.01 profit for Alpaca compliance
+        min_profit_required = 0.01
+        if (take_profit_price - entry_price) < min_profit_required:
+            take_profit_price = entry_price + min_profit_required
+            warnings.append(f"Take profit adjusted to meet minimum $0.01 requirement")
+        
         risk_reward_ratio = (take_profit_price - entry_price) / risk_per_share if risk_per_share > 0 else None
         
         # Add warnings for high risk
